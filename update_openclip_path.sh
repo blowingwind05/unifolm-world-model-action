@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# 获取当前用户的 HOME 目录
-USER_HOME=$HOME
-TARGET_PATH="$USER_HOME/unifolm-world-model-action/openclip/open_clip_pytorch_model.bin"
+# 获取仓库根目录（脚本所在目录即 repo root）
+REPO_ROOT=$(cd "$(dirname "$0")" && pwd)
+TARGET_PATH="$REPO_ROOT/openclip/open_clip_pytorch_model.bin"
 CONFIG_FILE="configs/inference/world_model_interaction.yaml"
 
 echo "正在修改配置文件: $CONFIG_FILE"
@@ -108,7 +108,7 @@ grep "version:" "$CONFIG_FILE"
 # 检查模型文件是否存在，如果不在目标位置但在 ckpts 下，提示移动
 if [ ! -f "$TARGET_PATH" ]; then
     echo "⚠️  警告: 目标路径下没有找到模型文件: $TARGET_PATH"
-    CKPT_PATH="$USER_HOME/unifolm-world-model-action/ckpts/open_clip_pytorch_model.bin"
+    CKPT_PATH="$REPO_ROOT/ckpts/open_clip_pytorch_model.bin"
     if [ -f "$CKPT_PATH" ]; then
         echo "ℹ️  发现模型文件在 ckpts 目录: $CKPT_PATH"
         echo "   你可以运行以下命令移动它："
