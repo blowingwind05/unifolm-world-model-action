@@ -131,7 +131,7 @@ Experiment/log
 
 ckpts/
 openclip/
-configs/inference/world_model_interaction.yaml
+
 
 # ASC Competition Results
 unitree_*/case*/output/
