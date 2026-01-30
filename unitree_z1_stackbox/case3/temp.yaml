@@ -1,0 +1,236 @@
+data:
+  params:
+    batch_size: 6
+    dataset_and_weights:
+      unitree_z1_stackbox: 1.0
+    num_workers: 12
+    test:
+      params:
+        cond_robot_label_prob: 0.0
+        crop_resolution:
+        - 320
+        - 512
+        data_dir: /home/panyuexi/unifolm-world-model-action/unitree_z1_stackbox/case3/world_model_interaction_prompts
+        frame_stride: 2
+        individual_normalization: true
+        load_raw_resolution: true
+        max_action_dim: ${model.params.agent_action_dim}
+        max_state_dim: ${model.params.agent_state_dim}
+        n_obs_steps: ${model.params.n_obs_steps_imagen}
+        normalization_mode: min_max
+        random_fs: false
+        resolution:
+        - 320
+        - 512
+        spatial_transform: resize_center_crop
+        video_length: ${model.params.wma_config.params.temporal_length}
+      target: unifolm_wma.data.wma_data.WMAData
+    wrap: false
+  target: unifolm_wma.utils.data.DataModuleFromConfig
+model:
+  normalization_config:
+    input_normalization_modes:
+      observation.state: min_max
+    input_shapes:
+      observation.state: ${model.params.wma_config.params.action_unet_config.params.input_dim}
+    output_normalization_modes:
+      action: min_max
+    output_shapes:
+      action: ${model.params.wma_config.params.action_unet_config.params.input_dim}
+  params:
+    agent_action_dim: 16
+    agent_state_dim: 16
+    base_scale: 0.7
+    channels: 4
+    cond_stage_config:
+      params:
+        freeze: true
+        layer: penultimate
+      target: unifolm_wma.modules.encoders.condition.FrozenOpenCLIPEmbedder
+    cond_stage_key: instruction
+    cond_stage_trainable: false
+    conditioning_key: hybrid
+    decision_making_only: false
+    dp_ema_config:
+      params:
+        inv_gamma: 1.0
+        max_value: 0.9999
+        min_value: 0.0
+        power: 0.75
+        update_after_step: 0
+      target: unifolm_wma.models.diffusion_head.ema_model.EMAModel
+    dp_optimizer_config:
+      params:
+        betas:
+        - 0.95
+        - 0.999
+        eps: 1.0e-08
+        lr: 0.0001
+        weight_decay: 1.0e-06
+      target: torch.optim.AdamW
+    dp_use_ema: true
+    first_stage_config:
+      params:
+        ddconfig:
+          attn_resolutions: []
+          ch: 128
+          ch_mult:
+          - 1
+          - 2
+          - 4
+          - 4
+          double_z: true
+          dropout: 0.0
+          in_channels: 3
+          num_res_blocks: 2
+          out_ch: 3
+          resolution: 256
+          z_channels: 4
+        embed_dim: 4
+        lossconfig:
+          target: torch.nn.Identity
+        monitor: val/rec_loss
+      target: unifolm_wma.models.autoencoder.AutoencoderKL
+    first_stage_key: video
+    fps_condition_type: fps
+    freeze_embedder: true
+    gradient_accumulate_every: 1
+    image_proj_stage_config:
+      params:
+        depth: 4
+        dim: 1024
+        dim_head: 64
+        embedding_dim: 1280
+        ff_mult: 4
+        heads: 12
+        num_queries: 16
+        output_dim: 1024
+        video_length: ${model.params.wma_config.params.temporal_length}
+      target: unifolm_wma.modules.encoders.resampler.Resampler
+    image_size:
+    - 40
+    - 64
+    img_cond_stage_config:
+      params:
+        freeze: true
+      target: unifolm_wma.modules.encoders.condition.FrozenOpenCLIPImageEmbedderV2
+    input_pertub: 0.1
+    linear_end: 0.012
+    linear_start: 0.00085
+    lr_scheduler: cosine
+    lr_warmup_steps: 2000
+    n_obs_steps_acting: 2
+    n_obs_steps_imagen: 2
+    noise_scheduler_config:
+      params:
+        beta_end: 0.02
+        beta_schedule: squaredcos_cap_v2
+        beta_start: 0.0001
+        clip_sample: true
+        num_train_timesteps: 1000
+        prediction_type: epsilon
+        set_alpha_to_one: true
+        steps_offset: 0
+      target: diffusers.DDIMScheduler
+    num_epochs: 30000
+    num_timesteps_cond: 1
+    parameterization: v
+    perframe_ae: true
+    rescale_betas_zero_snr: true
+    scale_by_std: false
+    scale_factor: 0.18215
+    timesteps: 1000
+    uncond_type: empty_seq
+    use_dynamic_rescale: true
+    use_ema: false
+    use_scheduler: true
+    wma_config:
+      params:
+        addition_attention: true
+        attention_resolutions:
+        - 4
+        - 2
+        - 1
+        base_model_gen_only: false
+        channel_mult:
+        - 1
+        - 2
+        - 4
+        - 4
+        context_dim: 1024
+        cross_attention_scale_learnable: false
+        default_fs: 10
+        dropout: 0.1
+        fs_condition: true
+        image_cross_attention: true
+        in_channels: 8
+        model_channels: 320
+        n_obs_steps: ${model.params.n_obs_steps_imagen}
+        num_head_channels: 64
+        num_res_blocks: 2
+        num_stem_token: 16
+        out_channels: 4
+        stem_process_config:
+          params:
+            chunk_size: ${model.params.wma_config.params.temporal_length}
+            depth: 1
+            dim: 1024
+            dim_head: 64
+            ff_mult: 4
+            heads: 16
+            num_queries: ${model.params.wma_config.params.num_stem_token}
+            output_dim: 1024
+          target: unifolm_wma.modules.encoders.condition.SATokenProjector
+        temporal_attention: true
+        temporal_conv: true
+        temporal_length: 16
+        temporal_selfatt_only: true
+        transformer_depth: 1
+        unet_head_config:
+          params:
+            act_proj_dim: 32
+            cond_cross_attention: false
+            cond_predict_scale: true
+            context_dims: []
+            diffusion_step_embed_dim: 128
+            down_dims:
+            - 256
+            - 512
+            - 1024
+            - 2048
+            horizon: ${model.params.wma_config.params.temporal_length}
+            image_size: ${model.params.image_size}
+            imagen_cond_gradient: true
+            input_dim: ${model.params.agent_action_dim}
+            kernel_size: 5
+            last_frame_only: false
+            n_groups: 8
+            n_obs_steps: ${model.params.n_obs_steps_acting}
+            num_head_channels: ${model.params.wma_config.params.num_head_channels}
+            obs_encoder_config:
+              params:
+                crop_shape: null
+                imagenet_norm: true
+                random_crop: false
+                resize_shape: null
+                rgb_model_config:
+                  params:
+                    name: resnet18
+                    weights: null
+                  target: unifolm_wma.models.diffusion_head.vision.model_getter.get_resnet
+                share_rgb_model: false
+                spatial_softmax_kp: 128
+                use_group_norm: true
+                use_spatial_softmax: true
+              target: unifolm_wma.models.diffusion_head.vision.multi_image_obs_encoder.MultiImageObsEncoder
+            use_imagen_mid_only: false
+            use_linear_act_proj: true
+            use_linear_attn: ${model.params.wma_config.params.use_linear}
+            use_z_only: false
+          target: unifolm_wma.models.diffusion_head.conditional_unet1d.ConditionalUnet1D
+        use_causal_attention: false
+        use_checkpoint: true
+        use_linear: true
+        use_relative_position: false
+      target: unifolm_wma.modules.networks.wma_model.WMAModel
+  target: unifolm_wma.models.ddpms.LatentVisualDiffusion
