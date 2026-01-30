@@ -130,6 +130,7 @@ Experiment/checkpoint
 Experiment/log
 
 ckpts/
+openclip/
 
 # ASC Competition Results
 unitree_*/case*/output/
