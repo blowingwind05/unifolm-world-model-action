@@ -1,17 +1,23 @@
+#!/bin/bash
+
 set -euo pipefail
 
 print_usage() {
     echo "用法: bash run_all_cluster.sh [--out-dir DIR] [--poll-interval SEC] [--no-wait] [--python-bin /path/to/python]"
+    echo "                       [--check-only]"
+    echo "  默认模式：master-worker（多节点/多 GPU 动态抢占队列并行跑不同 case）"
     echo "  --out-dir        本地汇总输出目录（默认：<repo>/cluster_reports_<timestamp>）"
     echo "  --poll-interval  轮询远端进度间隔秒数（默认：30）"
-    echo "  --no-wait        只触发远端运行，不等待、不拉取、不汇总"
+    echo "  --no-wait        只触发远端 worker 运行，不等待、不汇总"
     echo "  --python-bin     指定远端执行用的 Python（建议指向 conda env 的 python）"
+    echo "  --check-only     只做 SSH/Python/torch 预检，不启动任务"
 }
 
 OUT_DIR=""
 POLL_INTERVAL=30
 WAIT_FOR_COMPLETION=1
 REMOTE_PYTHON_BIN=""
+CHECK_ONLY=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -30,6 +36,10 @@ while [[ $# -gt 0 ]]; do
         --python-bin)
             REMOTE_PYTHON_BIN="$2"
             shift 2
+            ;;
+        --check-only)
+            CHECK_ONLY=1
+            shift 1
             ;;
         -h|--help)
             print_usage
@@ -52,7 +62,14 @@ HOST_LABELS=("icarus0.acsalab.com" "icarus1.acsalab.com" "icarus2.acsalab.com" "
 HOST_ADDRS=("10.1.26.220" "10.1.26.221" "10.1.26.222" "10.1.26.223")
 
 # SSH 选项：BatchMode 避免卡住；StrictHostKeyChecking=accept-new 首次连接自动记录指纹
-SSH_OPTS=("-o" "BatchMode=yes" "-o" "StrictHostKeyChecking=accept-new")
+# 加上超时与 keepalive，避免某个节点网络问题导致脚本卡住。
+SSH_OPTS=(
+    "-o" "BatchMode=yes"
+    "-o" "StrictHostKeyChecking=accept-new"
+    "-o" "ConnectTimeout=5"
+    "-o" "ServerAliveInterval=30"
+    "-o" "ServerAliveCountMax=3"
+)
 
 # 远端仓库路径
 REMOTE_REPO_DIR="/home/chenyq/code/unifolm-world-model-action"
@@ -61,9 +78,11 @@ REMOTE_REPO_DIR="/home/chenyq/code/unifolm-world-model-action"
 REMOTE_GPU_IDS="0,1"
 
 # SSH 启动不会继承你当前 shell 里激活的 conda 环境，因此必须显式指定远端 python。
-# 默认策略：如果你当前是在 conda env（比如 worldmodel）里运行该脚本，则用 $CONDA_PREFIX/bin/python。
+# 默认策略：优先使用 NFS 共享的 worldmodel 环境 python；否则再尝试当前 CONDA_PREFIX；最后退回 python3。
 if [[ -z "$REMOTE_PYTHON_BIN" ]]; then
-    if [[ -n "${CONDA_PREFIX:-}" ]] && [[ -x "${CONDA_PREFIX}/bin/python" ]]; then
+    if [[ -x "/home/chenyq/.conda/envs/worldmodel/bin/python" ]]; then
+        REMOTE_PYTHON_BIN="/home/chenyq/.conda/envs/worldmodel/bin/python"
+    elif [[ -n "${CONDA_PREFIX:-}" ]] && [[ -x "${CONDA_PREFIX}/bin/python" ]]; then
         REMOTE_PYTHON_BIN="${CONDA_PREFIX}/bin/python"
     else
         REMOTE_PYTHON_BIN="python3"
@@ -74,29 +93,30 @@ echo ">>> 将使用远端 Python: $REMOTE_PYTHON_BIN"
 
 remote_python_ok() {
     local host_addr="$1"
-    # 依赖 torch 的最小自检 + CUDA 可用性打印（不要求 cuda=true，但至少 torch 能 import）
-    ssh "${SSH_OPTS[@]}" "$host_addr" "$REMOTE_PYTHON_BIN - <<'PY'
-import sys
-try:
-    import torch
-    print('torch', torch.__version__)
-    print('cuda_available', torch.cuda.is_available())
-except Exception as e:
-    print('TORCH_IMPORT_FAILED:', repr(e))
-    sys.exit(2)
-PY" >/dev/null 2>&1
+    # 最小自检：python 存在且能 import torch（cuda 可用性不强制为 true）
+    ssh "${SSH_OPTS[@]}" "$host_addr" "$REMOTE_PYTHON_BIN -c 'import torch; import sys; print(sys.executable); print(torch.__version__); print(torch.cuda.is_available())'"
 }
 
 echo ">>> 预检各节点 Python/torch 环境..."
 for host_addr in "${HOST_ADDRS[@]}"; do
+    echo "[$host_addr]"
     if ! remote_python_ok "$host_addr"; then
         echo "[错误] 节点 $host_addr 无法用 $REMOTE_PYTHON_BIN import torch（或 python 不存在）。"
+        echo "建议在该节点上执行："
+        echo "  ssh $host_addr '$REMOTE_PYTHON_BIN -c \"import torch; print(torch.__version__)\"'"
+        echo "该节点的错误输出（便于定位）："
+        ssh "${SSH_OPTS[@]}" "$host_addr" "$REMOTE_PYTHON_BIN -c 'import torch; print(torch.__version__)'" 2>&1 || true
         echo "解决方式："
         echo "  1) 确认 worldmodel 环境在 NFS 共享路径上，且该 python 路径在所有节点都存在"
         echo "  2) 或者显式指定：bash run_all_cluster.sh --python-bin /path/to/conda/env/bin/python"
         exit 2
     fi
 done
+
+if [[ $CHECK_ONLY -eq 1 ]]; then
+    echo ">>> 预检完成：所有节点 OK（--check-only 退出）"
+    exit 0
+fi
 
 SCENARIOS=("unitree_g1_pack_camera" "unitree_z1_stackbox" "unitree_z1_dual_arm_stackbox" "unitree_z1_dual_arm_stackbox_v2" "unitree_z1_dual_arm_cleanup_pencils")
 CASES=("case1" "case2" "case3" "case4")
@@ -119,71 +139,9 @@ if [[ ${#HOST_LABELS[@]} -ne ${#HOST_ADDRS[@]} ]]; then
     exit 1
 fi
 
-# 为每台机器准备一个 case list（round-robin）
 TMP_DIR=$(mktemp -d)
-LIST_FILES=()
-for label in "${HOST_LABELS[@]}"; do
-    safe_label=$(echo "$label" | sed 's/[^a-zA-Z0-9._-]/_/g')
-    f="$TMP_DIR/cases_${safe_label}.txt"
-    : > "$f"
-    LIST_FILES+=("$f")
-done
-
-for i in "${!ALL_CASES[@]}"; do
-    host_idx=$((i % NUM_HOSTS))
-    echo "${ALL_CASES[$i]}" >> "${LIST_FILES[$host_idx]}"
-done
 
 echo ">>> 将 ${#ALL_CASES[@]} 个任务分发到 ${NUM_HOSTS} 台机器"
-
-deploy_and_run_on_host() {
-    local host_label="$1"
-    local host_addr="$2"
-    local list_file="$3"
-
-    local safe_label
-    safe_label=$(echo "$host_label" | sed 's/[^a-zA-Z0-9._-]/_/g')
-
-    local remote_list="/tmp/wma_cases_${safe_label}_$$.txt"
-    local remote_log="/tmp/wma_run_${safe_label}_$$.log"
-    local remote_report="$REMOTE_REPO_DIR/benchmark_report_${safe_label}.log"
-
-    echo "[$host_label @ $host_addr] 上传 case list 到 $remote_list 并启动运行"
-
-    # 把 case list 通过 stdin 写到远端文件，避免依赖 scp/rsync
-    ssh "${SSH_OPTS[@]}" "$host_addr" "cat > '$remote_list'" < "$list_file"
-
-    # 后台运行
-    ssh "${SSH_OPTS[@]}" "$host_addr" "cd '$REMOTE_REPO_DIR' && PYTHON_BIN='$REMOTE_PYTHON_BIN' nohup bash run_all_parallel.sh --gpus '$REMOTE_GPU_IDS' --case-list '$remote_list' --report '$remote_report' > '$remote_log' 2>&1 & echo \$!" \
-        > "$TMP_DIR/pid_${safe_label}.txt"
-
-    local pid
-    pid=$(cat "$TMP_DIR/pid_${safe_label}.txt" | tr -d '\r\n')
-    echo "[$host_label] 已启动 PID=$pid"
-    echo "[$host_label] 日志: $remote_log"
-    echo "[$host_label] 报告: $remote_report"
-
-    # 记录映射，供后续等待/拉取
-    echo "$host_label|$host_addr|$pid|$remote_log|$remote_report" >> "$TMP_DIR/hosts.map"
-}
-
-for idx in "${!HOST_ADDRS[@]}"; do
-    deploy_and_run_on_host "${HOST_LABELS[$idx]}" "${HOST_ADDRS[$idx]}" "${LIST_FILES[$idx]}"
-done
-
-echo ""
-echo "[完成] 已在所有机器上触发运行。"
-echo "你可以用下面命令查看某台机器进度："
-echo "  ssh 10.1.26.221 'tail -f /tmp/wma_run_icarus1.acsalab.com_*.log'"
-echo "或者查看远端报告："
-echo "  ssh 10.1.26.221 'ls -1 $REMOTE_REPO_DIR/benchmark_report_*.log'"
-
-if [[ $WAIT_FOR_COMPLETION -eq 0 ]]; then
-    echo ""
-    echo "[跳过] --no-wait 已指定，不等待/不拉取/不汇总。"
-    rm -rf "$TMP_DIR" 2>/dev/null || true
-    exit 0
-fi
 
 if [[ -z "$OUT_DIR" ]]; then
     SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -192,10 +150,72 @@ fi
 mkdir -p "$OUT_DIR"
 
 # 保存一份 host 映射，便于排查问题
-cp "$TMP_DIR/hosts.map" "$OUT_DIR/hosts.map" 2>/dev/null || true
+HOSTS_MAP_FILE="$OUT_DIR/hosts.map"
+: > "$HOSTS_MAP_FILE"
 
 LOCAL_MERGED="$OUT_DIR/cluster_benchmark_report.log"
 LOCAL_TABLE="$OUT_DIR/cluster_benchmark_table.tsv"
+
+start_master_worker() {
+    echo ">>> 使用 master-worker 动态队列分配任务"
+
+    local queue_file="$OUT_DIR/cases.queue"
+    local queue_lock_dir="$OUT_DIR/.queue_lock"
+    local result_tsv="$OUT_DIR/results.tsv"
+    local result_lock_dir="$OUT_DIR/.result_lock"
+    local log_dir="$OUT_DIR/logs"
+    mkdir -p "$log_dir"
+    rm -f "$queue_file" "$result_tsv" 2>/dev/null || true
+    rmdir "$queue_lock_dir" 2>/dev/null || true
+    rmdir "$result_lock_dir" 2>/dev/null || true
+
+    printf "%s\n" "${ALL_CASES[@]}" > "$queue_file"
+    echo -e "host\tgpu\tcase\ttime\tpsnr\texit_code" > "$result_tsv"
+
+    # 为每个节点每张 GPU 启动一个 worker（并发拉任务）
+    IFS=',' read -r -a GPU_LIST <<< "$REMOTE_GPU_IDS"
+    for idx in "${!HOST_ADDRS[@]}"; do
+        host_label="${HOST_LABELS[$idx]}"
+        host_addr="${HOST_ADDRS[$idx]}"
+
+        for gpu in "${GPU_LIST[@]}"; do
+            remote_log="/tmp/wma_worker_${host_label}_gpu${gpu}_$$.log"
+            ssh "${SSH_OPTS[@]}" "$host_addr" "cd '$REMOTE_REPO_DIR' && nohup bash cluster_worker.sh \
+                --repo-dir '$REMOTE_REPO_DIR' \
+                --host-label '$host_label' \
+                --gpu '$gpu' \
+                --python-bin '$REMOTE_PYTHON_BIN' \
+                --queue-file '$queue_file' \
+                --queue-lock-dir '$queue_lock_dir' \
+                --result-tsv '$result_tsv' \
+                --result-lock-dir '$result_lock_dir' \
+                --log-dir '$log_dir' \
+                > '$remote_log' 2>&1 & echo \$!" \
+                > "$TMP_DIR/pid_${host_label}_gpu${gpu}.txt"
+
+            pid=$(cat "$TMP_DIR/pid_${host_label}_gpu${gpu}.txt" | tr -d '\r\n' | awk '{print $1}')
+            echo "$host_label|$host_addr|$pid|$remote_log|$result_tsv" >> "$HOSTS_MAP_FILE"
+            echo "[$host_label @ $host_addr] worker gpu=$gpu pid=$pid log=$remote_log"
+        done
+    done
+}
+
+start_master_worker
+
+echo ""
+echo "[完成] 已在所有机器上触发运行。"
+echo "你可以用下面命令查看某台机器 worker 日志："
+echo "  ssh 10.1.26.221 'ls -1t /tmp/wma_worker_* | head'"
+echo "  ssh 10.1.26.221 'tail -f /tmp/wma_worker_icarus1.acsalab.com_gpu0_*.log'"
+echo "或者在共享目录看全局结果："
+echo "  tail -f $OUT_DIR/results.tsv"
+
+if [[ $WAIT_FOR_COMPLETION -eq 0 ]]; then
+    echo ""
+    echo "[跳过] --no-wait 已指定，不等待/不拉取/不汇总。"
+    rm -rf "$TMP_DIR" 2>/dev/null || true
+    exit 0
+fi
 
 echo "" | tee "$LOCAL_MERGED" > /dev/null
 echo "================ ASC26 四机汇总报告 ================" | tee -a "$LOCAL_MERGED" > /dev/null
@@ -203,6 +223,7 @@ echo "开始时间: $(date)" | tee -a "$LOCAL_MERGED" > /dev/null
 echo "远端仓库: $REMOTE_REPO_DIR" | tee -a "$LOCAL_MERGED" > /dev/null
 echo "GPUs(每机): $REMOTE_GPU_IDS" | tee -a "$LOCAL_MERGED" > /dev/null
 echo "Python: $REMOTE_PYTHON_BIN" | tee -a "$LOCAL_MERGED" > /dev/null
+echo "Mode: master-worker" | tee -a "$LOCAL_MERGED" > /dev/null
 echo "----------------------------------------------------" | tee -a "$LOCAL_MERGED" > /dev/null
 
 is_pid_running_remote() {
@@ -218,64 +239,41 @@ while true; do
         if is_pid_running_remote "$host_addr" "$pid"; then
             running=$((running + 1))
         fi
-    done < "$TMP_DIR/hosts.map"
+    done < "$HOSTS_MAP_FILE"
 
     if [[ $running -eq 0 ]]; then
         break
     fi
 
-    echo "仍在运行的节点数: $running / $NUM_HOSTS (next check in ${POLL_INTERVAL}s)"
+    total_workers=$(grep -c '|' "$HOSTS_MAP_FILE" 2>/dev/null || echo 0)
+    echo "仍在运行的 worker 数: $running / $total_workers (next check in ${POLL_INTERVAL}s)"
     sleep "$POLL_INTERVAL"
 done
 
 echo ">>> 远端任务已全部结束，开始拉取报告并汇总..."
 
-# 表头：host\tcase\ttime\tpsnr\tdevice
-echo -e "host\tcase\ttime\tpsnr\tdevice" > "$LOCAL_TABLE"
-
-while IFS='|' read -r host_label host_addr pid remote_log remote_report; do
-    safe_label=$(echo "$host_label" | sed 's/[^a-zA-Z0-9._-]/_/g')
-    local_host_report="$OUT_DIR/benchmark_report_${safe_label}.log"
-    local_host_log="$OUT_DIR/run_${safe_label}.log"
-
-    # 拉远端 stdout/stderr 日志
-    ssh "${SSH_OPTS[@]}" "$host_addr" "cat '$remote_log'" > "$local_host_log" 2>/dev/null || true
-
-    # 报告优先从共享 /home(NFS) 直接读取；若不存在再尝试 SSH 拉取
-    if [[ -f "$remote_report" ]]; then
-        cp "$remote_report" "$local_host_report" 2>/dev/null || true
-    elif ssh "${SSH_OPTS[@]}" "$host_addr" "test -f '$remote_report'" >/dev/null 2>&1; then
-        ssh "${SSH_OPTS[@]}" "$host_addr" "cat '$remote_report'" > "$local_host_report" 2>/dev/null || true
-    else
-        echo "[$host_label] 报告不存在: $remote_report" | tee -a "$LOCAL_MERGED" > /dev/null
-        continue
-    fi
-
-    echo "" | tee -a "$LOCAL_MERGED" > /dev/null
-    echo "---------------- $host_label ($host_addr) ----------------" | tee -a "$LOCAL_MERGED" > /dev/null
-    tail -n +1 "$local_host_report" | tee -a "$LOCAL_MERGED" > /dev/null
-
-    # 抽取每行结果并转换成 TSV 追加到总表
-    # 原行格式：CASE_NAME | TIME_DESC | PSNR | GPU X
-    grep -E "^[a-zA-Z0-9._-]+-case[0-9]+[[:space:]]*\|" "$local_host_report" \
-        | awk -F'\|' -v host="$host_label" '{
-            gsub(/^[ \t]+|[ \t]+$/, "", $1);
-            gsub(/^[ \t]+|[ \t]+$/, "", $2);
-            gsub(/^[ \t]+|[ \t]+$/, "", $3);
-            gsub(/^[ \t]+|[ \t]+$/, "", $4);
-            print host"\t"$1"\t"$2"\t"$3"\t"$4;
+RESULT_TSV="$OUT_DIR/results.tsv"
+if [[ -f "$RESULT_TSV" ]]; then
+    echo -e "host\tcase\ttime\tpsnr\tdevice\texit_code" > "$LOCAL_TABLE"
+    tail -n +2 "$RESULT_TSV" \
+        | grep -v "__worker_" \
+        | awk -F'\t' '{
+            host=$1; gpu=$2; case=$3; time=$4; psnr=$5; exit_code=$6;
+            print host"\t"case"\t"time"\t"psnr"\tGPU "gpu"\t"exit_code;
         }' >> "$LOCAL_TABLE" || true
-
-done < "$TMP_DIR/hosts.map"
+else
+    echo "[警告] 未找到 results.tsv：$RESULT_TSV" | tee -a "$LOCAL_MERGED" > /dev/null
+    echo -e "host\tcase\ttime\tpsnr\tdevice\texit_code" > "$LOCAL_TABLE"
+fi
 
 echo "" | tee -a "$LOCAL_MERGED" > /dev/null
 echo "================ 汇总表 (TSV) ================" | tee -a "$LOCAL_MERGED" > /dev/null
 echo "文件: $LOCAL_TABLE" | tee -a "$LOCAL_MERGED" > /dev/null
 
 # 输出一个按 case 排序的可读表到 merged 报告尾部
-echo "host | case | time | psnr | device" | tee -a "$LOCAL_MERGED" > /dev/null
+echo "host | case | time | psnr | device | exit_code" | tee -a "$LOCAL_MERGED" > /dev/null
 echo "----------------------------------------------------" | tee -a "$LOCAL_MERGED" > /dev/null
-tail -n +2 "$LOCAL_TABLE" | sort -t$'\t' -k2,2 | awk -F'\t' '{printf "%s | %s | %s | %s | %s\n", $1,$2,$3,$4,$5}' \
+tail -n +2 "$LOCAL_TABLE" | sort -t$'\t' -k2,2 | awk -F'\t' '{printf "%s | %s | %s | %s | %s | %s\n", $1,$2,$3,$4,$5,$6}' \
     | tee -a "$LOCAL_MERGED" > /dev/null
 
 echo "----------------------------------------------------" | tee -a "$LOCAL_MERGED" > /dev/null

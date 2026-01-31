@@ -132,9 +132,11 @@ Experiment/log
 ckpts/
 openclip/
 
+cluster_reports_*/
+
 
 # ASC Competition Results
 unitree_*/case*/output/
 unitree_*/case*/output.log
 unitree_*/case*/psnr_score.json
-benchmark_report.log
+benchmark_report*
