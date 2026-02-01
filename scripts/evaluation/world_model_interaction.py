@@ -9,6 +9,7 @@ import logging
 import einops
 import warnings
 import imageio
+from concurrent.futures import ThreadPoolExecutor
 
 from pytorch_lightning import seed_everything
 from omegaconf import OmegaConf
@@ -148,6 +149,44 @@ def save_results(video: Tensor, filename: str, fps: int = 8) -> None:
                                fps=fps,
                                video_codec='h264',
                                options={'crf': '10'})
+
+
+class AsyncVideoWriter:
+    """Simple threadpool-based async video writer to avoid blocking the main loop."""
+
+    def __init__(self, max_workers: int = 2) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._futures = []
+
+    @staticmethod
+    def _write_video(video: Tensor, filename: str, fps: int) -> None:
+        video = torch.clamp(video.float(), -1., 1.)
+        n = video.shape[0]
+        video = video.permute(2, 0, 1, 3, 4)
+
+        frame_grids = [
+            torchvision.utils.make_grid(framesheet, nrow=int(n), padding=0)
+            for framesheet in video
+        ]
+        grid = torch.stack(frame_grids, dim=0)
+        grid = (grid + 1.0) / 2.0
+        grid = (grid * 255).to(torch.uint8).permute(0, 2, 3, 1)
+        torchvision.io.write_video(filename,
+                                   grid,
+                                   fps=fps,
+                                   video_codec='h264',
+                                   options={'crf': '10'})
+
+    def submit(self, video: Tensor, filename: str, fps: int = 8) -> None:
+        # 非阻塞搬到 CPU，再在线程池里做后处理/写盘，避免主线程同步等待。
+        video_cpu = video.detach().to("cpu", non_blocking=True)
+        self._futures.append(
+            self._executor.submit(self._write_video, video_cpu, filename, fps))
+
+    def close(self) -> None:
+        for fut in self._futures:
+            fut.result()
+        self._executor.shutdown(wait=True)
 
 
 def get_init_frame_path(data_dir: str, sample: dict) -> str:
@@ -473,6 +512,8 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
     model = model.cuda(gpu_no)
     device = get_device_from_parameters(model)
 
+    video_writer = AsyncVideoWriter(max_workers=2)
+
     # Run over data
     assert (args.height % 16 == 0) and (
         args.width % 16
@@ -659,18 +700,16 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
 
                 # Save the imagen videos for decision-making
                 sample_video_file = f'{video_save_dir}/dm/{fs}/itr-{itr}.mp4'
-                save_results(pred_videos_0.cpu(),
-                             sample_video_file,
-                             fps=args.save_fps)
+                video_writer.submit(pred_videos_0, sample_video_file,
+                                     fps=args.save_fps)
                 # Save videos environment changes via world-model interaction
                 sample_video_file = f'{video_save_dir}/wm/{fs}/itr-{itr}.mp4'
-                save_results(pred_videos_1.cpu(),
-                             sample_video_file,
-                             fps=args.save_fps)
+                video_writer.submit(pred_videos_1, sample_video_file,
+                                     fps=args.save_fps)
 
                 print('>' * 24)
                 # Collect the result of world-model interactions
-                wm_video.append(pred_videos_1[:, :, :args.exe_steps].cpu())
+                wm_video.append(pred_videos_1[:, :, :args.exe_steps])
 
             full_video = torch.cat(wm_video, dim=2)
             sample_tag = f"{args.dataset}-vid{sample['videoid']}-wd-fs-{fs}/full"
@@ -679,7 +718,11 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
                                sample_tag,
                                fps=args.save_fps)
             sample_full_video_file = f"{video_save_dir}/../{sample['videoid']}_full_fs{fs}.mp4"
-            save_results(full_video, sample_full_video_file, fps=args.save_fps)
+            video_writer.submit(full_video, sample_full_video_file,
+                                 fps=args.save_fps)
+
+            # 等待所有后台写盘完成，避免进程提前退出。
+            video_writer.close()
 
 
 def get_parser():
