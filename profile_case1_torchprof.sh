@@ -100,9 +100,18 @@ if repo_root not in sys.path:
 # 检测 CUPTI：没有 CUPTI 时，PyTorch profiler 的 CUDA(Device) 侧耗时通常会全部显示为 0。
 try:
   import torch
+  print("[TorchProfiler] torch:", getattr(torch, "__version__", "unknown"))
+  print("[TorchProfiler] torch.version.cuda:", getattr(torch.version, "cuda", None))
+  print("[TorchProfiler] cuda.is_available:", torch.cuda.is_available())
   if torch.cuda.is_available():
     try:
+      print("[TorchProfiler] cuda.device_count:", torch.cuda.device_count())
+      print("[TorchProfiler] cuda.device_name[0]:", torch.cuda.get_device_name(0))
+    except Exception:
+      pass
+    try:
       ctypes.CDLL("libcupti.so")
+      print("[TorchProfiler] CUPTI 已加载：libcupti.so")
     except OSError:
       print("[TorchProfiler][警告] 未找到 libcupti.so（CUPTI）。")
       print("[TorchProfiler][警告] 这会导致 TensorBoard/Profiler 的 Device self/total duration 全为 0。")
@@ -114,15 +123,28 @@ except Exception as e:
 
 with_stack = bool(int("$WITH_STACK"))
 light = bool(int("$LIGHT"))
+requested_steps = int("$N_ITER")
 
 # 轻量模式：减少事件体积，显著提升 TensorBoard 加载速度
 record_shapes = (not light)
 profile_memory = (not light)
 active_steps = 1 if light else 2
 
+# schedule 参数：默认跳过1步 + 预热1步 + 采集(active_steps)步。
+# 但当 requested_steps 太小时（例如你为了快速验证设置了 --steps 2），会导致根本没有进入采集阶段，
+# trace 会非常“空”，TensorBoard 里 device duration 可能全为 0。
+wait_steps = 1
+warmup_steps = 1
+need_steps = wait_steps + warmup_steps + active_steps
+if requested_steps < need_steps:
+  wait_steps = 0
+  warmup_steps = 0
+  active_steps = max(1, min(active_steps, requested_steps))
+  print(f"[TorchProfiler][提示] --steps={requested_steps} 太小，已自动调整 schedule 为 wait={wait_steps}, warmup={warmup_steps}, active={active_steps}。")
+
 prof = profile(
     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-  schedule=schedule(wait=1, warmup=1, active=active_steps, repeat=1),
+  schedule=schedule(wait=wait_steps, warmup=warmup_steps, active=active_steps, repeat=1),
     on_trace_ready=tensorboard_trace_handler(logdir),
   record_shapes=record_shapes,
   profile_memory=profile_memory,
